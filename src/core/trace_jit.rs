@@ -952,7 +952,16 @@ impl TraceJit {
         let cpu_type = recording.cpu_type;
         let adaptive_rerecords = recording.adaptive_rerecords;
         #[cfg(feature = "trace-profile")]
-        let recorded_ops = recording.ops.len();
+        let recorded_shape = recording
+            .ops
+            .iter()
+            .map(|op| super::trace_profile::TraceShapeOp {
+                pc: op.pc,
+                opcode: op.opcode,
+                extension: op.extension,
+                extension2: op.extension2,
+            })
+            .collect();
         self.slots[idx] =
             match self.compile_decoded_ops(cpu, start_pc, cpu_type, recording.ops, Some(exit_pc)) {
                 Some(mut trace) => {
@@ -972,7 +981,7 @@ impl TraceJit {
             };
         #[cfg(feature = "trace-profile")]
         if matches!(self.slots[idx], TraceSlot::Compiled(_)) {
-            super::trace_profile::note_compiled(start_pc, cpu_type, recorded_ops);
+            super::trace_profile::note_compiled(start_pc, cpu_type, recorded_shape);
         }
     }
 
@@ -996,13 +1005,28 @@ impl TraceJit {
 
         let Some(mut op) = decode_trace_op(cpu, bus, executed_pc, cpu_type) else {
             #[cfg(feature = "trace-profile")]
-            super::trace_profile::note_blocker(
-                start_pc,
-                cpu_type,
-                recording.ops.len(),
-                executed_pc,
-                cpu.ir as u16,
-            );
+            {
+                let opcode_address = cpu.address(executed_pc);
+                let memory_opcode = bus.try_read_word(opcode_address).ok();
+                let extension = bus
+                    .try_read_word(cpu.address(executed_pc.wrapping_add(2)))
+                    .ok();
+                let extension2 = bus
+                    .try_read_word(cpu.address(executed_pc.wrapping_add(4)))
+                    .ok();
+                super::trace_profile::note_blocker(
+                    start_pc,
+                    cpu_type,
+                    recording.ops.len(),
+                    super::trace_profile::TraceBlocker {
+                        pc: executed_pc,
+                        executed_opcode: cpu.ir as u16,
+                        memory_opcode,
+                        extension,
+                        extension2,
+                    },
+                );
+            }
             self.finish_recording(cpu, executed_pc);
             return;
         };

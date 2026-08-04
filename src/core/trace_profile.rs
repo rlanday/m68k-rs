@@ -45,6 +45,78 @@ pub struct TraceProfileRow {
     pub adaptive_rerecords: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Why replay-time decoding could not append an executed instruction.
+pub enum TraceDecodeFailureReason {
+    /// The recorder could not read the opcode from guest memory.
+    OpcodeReadFailed,
+    /// The opcode executed by the CPU no longer matches guest memory.
+    OpcodeChanged,
+    /// Memory still contains the executed opcode, but its form is not
+    /// traceable or an operand-extension read failed.
+    UnsupportedFormOrOperandRead,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// One instruction captured in a successfully compiled trace path.
+pub struct TraceShapeOp {
+    /// Guest address at which the instruction executed.
+    pub pc: u32,
+    /// Primary opcode word.
+    pub opcode: u16,
+    /// First extension word captured by the trace decoder, if any.
+    pub extension: Option<u16>,
+    /// Second extension word captured by the trace decoder, if any.
+    pub extension2: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TraceBlocker {
+    pub(crate) pc: u32,
+    pub(crate) executed_opcode: u16,
+    pub(crate) memory_opcode: Option<u16>,
+    pub(crate) extension: Option<u16>,
+    pub(crate) extension2: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// One distinct failed recording path for a trace head.
+pub struct FailedTraceShapeProfileRow {
+    /// Guest program counter at which recording began.
+    pub start_pc: u32,
+    /// CPU model active while recording.
+    pub cpu_type: CpuType,
+    /// Successfully reconstructed operations before the failure.
+    pub prefix_ops: u32,
+    /// Guest address of the instruction whose reconstruction failed.
+    pub blocker_pc: u32,
+    /// Opcode retained in the CPU's instruction register after execution.
+    pub executed_opcode: u16,
+    /// Opcode reread from guest memory while reconstructing the trace.
+    pub memory_opcode: Option<u16>,
+    /// First word after the memory opcode, when readable.
+    pub extension: Option<u16>,
+    /// Second word after the memory opcode, when readable.
+    pub extension2: Option<u16>,
+    /// Coarse classification of the reconstruction failure.
+    pub reason: TraceDecodeFailureReason,
+    /// Number of recording attempts with this exact shape.
+    pub recordings: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// One distinct successfully compiled path for a trace head.
+pub struct CompiledTraceShapeProfileRow {
+    /// Guest program counter at which recording began.
+    pub start_pc: u32,
+    /// CPU model active while recording.
+    pub cpu_type: CpuType,
+    /// Executed instructions in dynamic path order.
+    pub ops: Vec<TraceShapeOp>,
+    /// Number of times this exact path was compiled.
+    pub recordings: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Execution count aggregated by decoded memory-operation opcode.
 pub struct DecodedMemProfileRow {
@@ -84,6 +156,13 @@ pub struct TraceProfileSnapshot {
     pub decoded_mem_ops: Vec<DecodedMemProfileRow>,
     /// Decoded memory counts split by guest PC and opcode.
     pub decoded_mem_sites: Vec<DecodedMemSiteProfileRow>,
+    /// Failed paths kept separately from successful recordings at the same
+    /// trace head. This prevents a historical blocker from being mistaken
+    /// for the boundary of the currently compiled path.
+    pub failed_shapes: Vec<FailedTraceShapeProfileRow>,
+    /// Successfully compiled dynamic paths, including their exact executed
+    /// guest instruction sequence.
+    pub compiled_shapes: Vec<CompiledTraceShapeProfileRow>,
     /// Total observed backward branches.
     pub backward_hits: u64,
     /// Total rejected trace-entry opportunities.
@@ -116,6 +195,10 @@ impl TraceProfileSnapshot {
             out,
             "totals: backward_hits={} rejected_hits={} native_calls={} jit_retired={} avg_ops_per_native_call={average:.2}",
             self.backward_hits, self.rejected_hits, self.native_calls, self.jit_retired
+        );
+        let _ = writeln!(
+            out,
+            "note: head rows aggregate the process lifetime; failure and compiled columns may describe different recording paths. See the shape tables below."
         );
         let _ = writeln!(
             out,
@@ -176,6 +259,81 @@ impl TraceProfileSnapshot {
                 row.guarded_branch_exits,
                 row.adaptive_rerecords
             );
+        }
+
+        let mut failed_shapes = self.failed_shapes.clone();
+        failed_shapes.sort_unstable_by(|a, b| {
+            b.recordings
+                .cmp(&a.recordings)
+                .then_with(|| b.prefix_ops.cmp(&a.prefix_ops))
+                .then_with(|| a.start_pc.cmp(&b.start_pc))
+        });
+        let _ = writeln!(out, "failed recording shapes");
+        let _ = writeln!(
+            out,
+            "rank  start_pc  records prefix blocker_pc ir   memory ext1 ext2 reason"
+        );
+        for (rank, shape) in failed_shapes.iter().take(40).enumerate() {
+            let memory = shape
+                .memory_opcode
+                .map_or_else(|| "----".to_owned(), |value| format!("{value:04X}"));
+            let extension = shape
+                .extension
+                .map_or_else(|| "----".to_owned(), |value| format!("{value:04X}"));
+            let extension2 = shape
+                .extension2
+                .map_or_else(|| "----".to_owned(), |value| format!("{value:04X}"));
+            let reason = match shape.reason {
+                TraceDecodeFailureReason::OpcodeReadFailed => "opcode-read-failed",
+                TraceDecodeFailureReason::OpcodeChanged => "opcode-changed",
+                TraceDecodeFailureReason::UnsupportedFormOrOperandRead => {
+                    "unsupported-form-or-operand-read"
+                }
+            };
+            let _ = writeln!(
+                out,
+                "{:>4}  {:08X} {:>8} {:>6}   {:08X} {:04X} {} {} {} {}",
+                rank + 1,
+                shape.start_pc,
+                shape.recordings,
+                shape.prefix_ops,
+                shape.blocker_pc,
+                shape.executed_opcode,
+                memory,
+                extension,
+                extension2,
+                reason
+            );
+        }
+
+        let mut compiled_shapes = self.compiled_shapes.clone();
+        compiled_shapes.sort_unstable_by(|a, b| {
+            b.recordings
+                .cmp(&a.recordings)
+                .then_with(|| b.ops.len().cmp(&a.ops.len()))
+                .then_with(|| a.start_pc.cmp(&b.start_pc))
+        });
+        let _ = writeln!(out, "compiled recording shapes");
+        for (rank, shape) in compiled_shapes.iter().take(40).enumerate() {
+            let _ = writeln!(
+                out,
+                "{:>4}  {:08X} records={} ops={}",
+                rank + 1,
+                shape.start_pc,
+                shape.recordings,
+                shape.ops.len()
+            );
+            let _ = write!(out, "      path:");
+            for op in &shape.ops {
+                let _ = write!(out, " {:08X}:{:04X}", op.pc, op.opcode);
+                if let Some(extension) = op.extension {
+                    let _ = write!(out, "/{extension:04X}");
+                }
+                if let Some(extension) = op.extension2 {
+                    let _ = write!(out, "/{extension:04X}");
+                }
+            }
+            let _ = writeln!(out);
         }
 
         let mut decoded_mem_ops = self.decoded_mem_ops.clone();
@@ -246,6 +404,21 @@ struct Row {
     adaptive_rerecords: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct FailedShapeKey {
+    start_pc: u32,
+    cpu_type: u32,
+    prefix_ops: u32,
+    blocker_pc: u32,
+    executed_opcode: u16,
+    memory_opcode: Option<u16>,
+    extension: Option<u16>,
+    extension2: Option<u16>,
+    reason: TraceDecodeFailureReason,
+}
+
+type CompiledShapeKey = (u32, u32, Vec<TraceShapeOp>);
+
 /// The site key is already a uniformly useful `(pc << 16) | opcode` integer,
 /// so hashing it again only adds overhead to this hot, feature-only profiler.
 #[derive(Default)]
@@ -274,6 +447,8 @@ type SiteCounts = HashMap<u64, u64, BuildHasherDefault<IdentityHasher>>;
 
 struct Profile {
     rows: BTreeMap<(u32, u32), Row>,
+    failed_shapes: BTreeMap<FailedShapeKey, u64>,
+    compiled_shapes: BTreeMap<CompiledShapeKey, u64>,
     decoded_mem_counts: Box<[u64]>,
     decoded_mem_site_counts: SiteCounts,
 }
@@ -282,6 +457,8 @@ impl Default for Profile {
     fn default() -> Self {
         Self {
             rows: BTreeMap::new(),
+            failed_shapes: BTreeMap::new(),
+            compiled_shapes: BTreeMap::new(),
             decoded_mem_counts: vec![0; super::op_cache::DECODE_TABLE_SIZE].into_boxed_slice(),
             decoded_mem_site_counts: SiteCounts::default(),
         }
@@ -338,6 +515,34 @@ impl Profile {
                 executions,
             })
             .collect();
+        let failed_shapes = self
+            .failed_shapes
+            .iter()
+            .map(|(key, &recordings)| FailedTraceShapeProfileRow {
+                start_pc: key.start_pc,
+                cpu_type: cpu_type_from_repr(key.cpu_type),
+                prefix_ops: key.prefix_ops,
+                blocker_pc: key.blocker_pc,
+                executed_opcode: key.executed_opcode,
+                memory_opcode: key.memory_opcode,
+                extension: key.extension,
+                extension2: key.extension2,
+                reason: key.reason,
+                recordings,
+            })
+            .collect();
+        let compiled_shapes = self
+            .compiled_shapes
+            .iter()
+            .map(
+                |((start_pc, cpu_type, ops), &recordings)| CompiledTraceShapeProfileRow {
+                    start_pc: *start_pc,
+                    cpu_type: cpu_type_from_repr(*cpu_type),
+                    ops: ops.clone(),
+                    recordings,
+                },
+            )
+            .collect();
         TraceProfileSnapshot {
             backward_hits: rows.iter().map(|row| row.backward_hits).sum(),
             rejected_hits: rows.iter().map(|row| row.rejected_hits).sum(),
@@ -346,6 +551,8 @@ impl Profile {
             rows,
             decoded_mem_ops,
             decoded_mem_sites,
+            failed_shapes,
+            compiled_shapes,
         }
     }
 }
@@ -409,8 +616,7 @@ pub(crate) fn note_blocker(
     start_pc: u32,
     cpu_type: CpuType,
     prefix_ops: usize,
-    blocker_pc: u32,
-    blocker_opcode: u16,
+    blocker: TraceBlocker,
 ) {
     PROFILE.with_borrow_mut(|profile| {
         let row = profile.0.row(start_pc, cpu_type);
@@ -419,15 +625,41 @@ pub(crate) fn note_blocker(
         // blocker; path variation is visible through repeated recordings.
         if prefix_ops as u32 >= row.prefix_ops {
             row.prefix_ops = prefix_ops as u32;
-            row.blocker_pc = Some(blocker_pc);
-            row.blocker_opcode = Some(blocker_opcode);
+            row.blocker_pc = Some(blocker.pc);
+            row.blocker_opcode = Some(blocker.executed_opcode);
         }
+        let reason = match blocker.memory_opcode {
+            None => TraceDecodeFailureReason::OpcodeReadFailed,
+            Some(opcode) if opcode != blocker.executed_opcode => {
+                TraceDecodeFailureReason::OpcodeChanged
+            }
+            Some(_) => TraceDecodeFailureReason::UnsupportedFormOrOperandRead,
+        };
+        let key = FailedShapeKey {
+            start_pc,
+            cpu_type: cpu_type as u32,
+            prefix_ops: prefix_ops as u32,
+            blocker_pc: blocker.pc,
+            executed_opcode: blocker.executed_opcode,
+            memory_opcode: blocker.memory_opcode,
+            extension: blocker.extension,
+            extension2: blocker.extension2,
+            reason,
+        };
+        let recordings = profile.0.failed_shapes.entry(key).or_default();
+        *recordings = recordings.saturating_add(1);
     });
 }
 
-pub(crate) fn note_compiled(pc: u32, cpu_type: CpuType, ops: usize) {
+pub(crate) fn note_compiled(pc: u32, cpu_type: CpuType, ops: Vec<TraceShapeOp>) {
     PROFILE.with_borrow_mut(|profile| {
-        profile.0.row(pc, cpu_type).compiled_ops = ops as u32;
+        profile.0.row(pc, cpu_type).compiled_ops = ops.len() as u32;
+        let recordings = profile
+            .0
+            .compiled_shapes
+            .entry((pc, cpu_type as u32, ops))
+            .or_default();
+        *recordings = recordings.saturating_add(1);
     });
 }
 
@@ -478,14 +710,81 @@ mod tests {
     fn report_ranks_stranded_dispatches_not_raw_hits() {
         reset();
         note_backward_edge(0x100, CpuType::M68040, true);
-        note_blocker(0x100, CpuType::M68040, 2, 0x104, 0x4ead);
+        note_blocker(
+            0x100,
+            CpuType::M68040,
+            2,
+            TraceBlocker {
+                pc: 0x104,
+                executed_opcode: 0x4ead,
+                memory_opcode: Some(0x4ead),
+                extension: None,
+                extension2: None,
+            },
+        );
         for _ in 0..3 {
             note_backward_edge(0x200, CpuType::M68040, true);
         }
-        note_blocker(0x200, CpuType::M68040, 1, 0x202, 0x486d);
+        note_blocker(
+            0x200,
+            CpuType::M68040,
+            1,
+            TraceBlocker {
+                pc: 0x202,
+                executed_opcode: 0x486d,
+                memory_opcode: Some(0x486d),
+                extension: None,
+                extension2: None,
+            },
+        );
 
         let report = snapshot().report();
         assert!(report.find("00000200").unwrap() < report.find("00000100").unwrap());
+    }
+
+    #[test]
+    fn report_separates_failed_and_compiled_shapes_at_one_head() {
+        reset();
+        note_blocker(
+            0x100,
+            CpuType::M68040,
+            20,
+            TraceBlocker {
+                pc: 0x140,
+                executed_opcode: 0x4c01,
+                memory_opcode: Some(0x4c01),
+                extension: Some(0x0800),
+                extension2: Some(0xee80),
+            },
+        );
+        note_compiled(
+            0x100,
+            CpuType::M68040,
+            vec![
+                TraceShapeOp {
+                    pc: 0x100,
+                    opcode: 0x7000,
+                    extension: None,
+                    extension2: None,
+                },
+                TraceShapeOp {
+                    pc: 0x102,
+                    opcode: 0x60fc,
+                    extension: None,
+                    extension2: None,
+                },
+            ],
+        );
+
+        let snapshot = snapshot();
+        assert_eq!(snapshot.failed_shapes.len(), 1);
+        assert_eq!(snapshot.compiled_shapes.len(), 1);
+        assert_eq!(snapshot.failed_shapes[0].prefix_ops, 20);
+        assert_eq!(snapshot.compiled_shapes[0].ops.len(), 2);
+        let report = snapshot.report();
+        assert!(report.contains("failure and compiled columns may describe different"));
+        assert!(report.contains("00000140 4C01 4C01 0800 EE80"));
+        assert!(report.contains("path: 00000100:7000 00000102:60FC"));
     }
 
     #[test]
